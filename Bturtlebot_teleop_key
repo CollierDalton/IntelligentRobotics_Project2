@@ -1,0 +1,336 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2011, Willow Garage, Inc.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#    * Redistributions of source code must retain the above copyright
+#      notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above copyright
+#      notice, this list of conditions and the following disclaimer in the
+#      documentation and/or other materials provided with the distribution.
+#    * Neither the name of the Willow Garage, Inc. nor the names of its
+#      contributors may be used to endorse or promote products derived from
+#       this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+#*Josh Hamilton and Matt Kish helped us when we were stuck.*
+
+import rospy
+import sys
+import select
+import termios
+import tty
+import math
+import random
+#import keyboard
+
+from geometry_msgs.msg import Twist
+from kobuki_msgs.msg import SensorState
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+
+# Information message about how to use the robot
+instructions = """
+Control Your Turtlebot!
+---------------------------
+Moving around:
+   u    i    o
+   j    k    l
+   m    ,    .
+
+q/z : increase/decrease max speeds by 10%
+w/x : increase/decrease only linear speed by 10%
+e/c : increase/decrease only angular speed by 10%
+space key, k : force stop
+anything else : stop smoothly
+
+CTRL-C to quit
+"""
+
+moveBindings = {
+        'i':(1,0),
+        'o':(1,-1),
+        'j':(0,1),
+        'l':(0,-1),
+        'u':(1,1),
+        ',':(-1,0),
+        '.':(-1,1),
+        'm':(-1,-1),
+	   }
+
+speedBindings={
+        'q':(1.1,1.1),
+        'z':(.9,.9),
+        'w':(1.1,1),
+        'x':(.9,1),
+        'e':(1,1.1),
+        'c':(1,.9),
+          }
+
+
+# Function to get keyboard input
+def get_key_press():
+    tty.setraw(sys.stdin.fileno())
+    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+    if rlist:
+        key = sys.stdin.read(1)
+    else:
+        key = ''
+
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, terminal_settings)
+    return key
+
+# Global variable declarations
+linear_speed = 0.2
+angular_speed = 0.3
+bot_center = 2
+
+is_moving_forward = False
+is_turning = False
+is_avoiding_obstacle = False
+is_busy = False
+
+distance_moved = 0
+
+current_x_position = 0
+current_y_position = 0
+current_z_position = 0
+
+previous_x_position = 0
+previous_y_position = 0
+previous_z_position = 0
+
+current_angular_direction = 0
+previous_angular_direction = 0
+target_angular_difference = 0
+
+min_scan_ranges_three_sections = [8, 8, 8]
+min_scan_ranges_two_sections = [8, 8]
+
+#ANYTIME YOU SEE * 3.28, IT IS CONVERTING METERS TO FEET (1 FOOT = ABOUT 3.28 METERS)
+# Distance formula for 3D, input in meters but output in feet
+def calculate_distance(x2, y2, z2, x1, y1, z1):
+    return math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2) * 3.28
+
+# Call for bumper sensor data
+def handle_bumper_sensor(msg):
+    if msg.bumper > 0:
+        rospy.signal_shutdown("Collision")
+        print("COLLISION!!! Robot has detected a collision and has stopped.")
+
+# Call for odometer data
+def handle_odometer_data(msg):
+    global current_x_position, current_y_position, current_z_position, current_angular_direction
+    
+    pose = msg.pose.pose
+    position = pose.position
+    orientation = pose.orientation
+    
+    current_x_position = position.x
+    current_y_position = position.y
+    current_z_position = position.z
+    
+    w = orientation.w
+    z = orientation.z
+    current_angular_direction = 360 / math.pi * math.atan2(z, w)
+
+
+# Call for laser data
+def handle_laser_scan(msg):
+    global min_scan_ranges_three_sections, min_scan_ranges_two_sections
+
+    num_ranges_three_sections = len(msg.ranges) // 3
+    num_ranges_two_sections = len(msg.ranges) // 2
+
+    divided_ranges_three_sections = divide_ranges(msg.ranges, num_ranges_three_sections)
+    divided_ranges_two_sections = divide_ranges(msg.ranges, num_ranges_two_sections)
+
+    filtered_ranges_three_sections = filter_ranges(divided_ranges_three_sections)
+    filtered_ranges_two_sections = filter_ranges(divided_ranges_two_sections)
+
+    min_scan_ranges_three_sections = calculate_min_ranges(filtered_ranges_three_sections)
+    min_scan_ranges_two_sections = calculate_min_ranges(filtered_ranges_two_sections)
+
+def divide_ranges(ranges, num_sections):
+    return [ranges[i:i + num_sections] for i in range(0, len(ranges), num_sections)]
+
+def filter_ranges(ranges_list):
+    return [[x for x in subarray if not math.isnan(x)] for subarray in ranges_list]
+
+def calculate_min_ranges(filtered_ranges):
+    return [min(x) * 3.28 if x else 8 for x in filtered_ranges]
+
+
+
+# Main program
+if __name__ == "__main__":
+    terminal_settings = termios.tcgetattr(sys.stdin)
+
+    rospy.init_node('turtlebot_teleop')
+    publisher = rospy.Publisher('~cmd_vel', Twist, queue_size=5)
+    bumper_sensor_subscriber = rospy.Subscriber('/mobile_base/sensors/core', SensorState, handle_bumper_sensor)
+    odometer_subscriber = rospy.Subscriber('/odom', Odometry, handle_odometer_data)
+    laser_scan_subscriber = rospy.Subscriber('/scan', LaserScan, handle_laser_scan)
+
+    linear_velocity = 0
+    angular_velocity = 0
+    angular_velocity_constant = 0
+    target_linear_speed = 0
+    target_angular_speed = 0
+    control_linear_speed = 0
+    control_angular_speed = 0
+
+    try:
+        print(instructions)
+        while True:
+            key_press = get_key_press()
+            if key_press == '\x03':
+                break
+            elif key_press in moveBindings.keys():
+                is_moving_forward = False
+                is_turning = False
+                distance_moved = 0
+                linear_velocity = moveBindings[key_press][0]
+                angular_velocity = moveBindings[key_press][1]
+            elif key_press == ' ' or key_press == 'k':
+                is_moving_forward = False
+                is_turning = False
+                distance_moved = 0
+                linear_velocity = 0
+                angular_velocity = 0
+                control_linear_speed = 0
+                control_angular_speed = 0
+            elif is_avoiding_obstacle and ((min_scan_ranges_three_sections[1] > bot_center) or is_busy):
+                if not is_busy:
+                    is_busy = True
+                    previous_angular_direction = current_angular_direction
+                    if min_scan_ranges_two_sections[1] < min_scan_ranges_two_sections[0]:
+                        angular_velocity_constant = -1
+                    else:
+                        angular_velocity_constant = 1
+                is_moving_forward = False
+                is_turning = False
+                distance_moved = 0
+                target_angular_difference = 150
+                current_angular_difference = abs(current_angular_direction - previous_angular_direction)
+                if current_angular_difference < target_angular_difference:
+                    linear_velocity = 0
+                    angular_velocity = angular_velocity_constant
+                else:
+                    is_avoiding_obstacle = False
+                    is_busy = False
+                    target_angular_difference = 0
+                    linear_velocity = 0
+                    angular_velocity = 0
+                    angular_velocity_constant = 0
+
+            elif any(a < bot_center for a in min_scan_ranges_three_sections):
+                is_moving_forward = False
+                is_turning = False
+                distance_moved = 0
+                min_range_value = min(b for b in min_scan_ranges_three_sections)
+
+                if min_scan_ranges_three_sections[1] == min_range_value or max(c for c in min_scan_ranges_three_sections) < bot_center:
+                    linear_velocity = -1.5
+                    angular_velocity = 0
+                    is_avoiding_obstacle = True
+                elif min_scan_ranges_three_sections[2] == min_range_value:
+                    linear_velocity = 0
+                    angular_velocity = -1
+                else:
+                    linear_velocity = 0
+                    angular_velocity = 1
+
+            elif distance_moved >= 1:
+                if not is_turning:
+                    previous_angular_direction = current_angular_direction
+                    target_angular_difference = random.randint(-15, 15)
+                    is_turning = True
+                    is_moving_forward = False
+                current_angular_difference = current_angular_direction - previous_angular_direction
+                if target_angular_difference >= 0:
+                    if current_angular_difference >= target_angular_difference:
+                        is_turning = False
+                        distance_moved = 0
+                        linear_velocity = 0
+                        angular_velocity = 0
+                    else:
+                        linear_velocity = 0
+                        angular_velocity = 1
+                else:
+                    if current_angular_difference <= target_angular_difference:
+                        is_turning = False
+                        distance_moved = 0
+                        linear_velocity = 0
+                        angular_velocity = 0
+                    else:
+                        linear_velocity = 0
+                        angular_velocity = -1
+
+            else:
+                if not is_moving_forward:
+                    previous_x_position = current_x_position
+                    previous_y_position = current_y_position
+                    previous_z_position = current_z_position
+                    is_moving_forward = True
+                distance_moved = calculate_distance(current_x_position, current_y_position, current_z_position,
+                                                    previous_x_position, previous_y_position, previous_z_position)
+                linear_velocity = 1
+                angular_velocity = 0
+
+            target_linear_speed = linear_speed * linear_velocity
+            target_angular_speed = angular_speed * angular_velocity
+
+            if target_linear_speed > control_linear_speed:
+                control_linear_speed = min(target_linear_speed, control_linear_speed + 0.02)
+            elif target_linear_speed < control_linear_speed:
+                control_linear_speed = max(target_linear_speed, control_linear_speed - 0.02)
+            else:
+                control_linear_speed = target_linear_speed
+
+            if target_angular_speed > control_angular_speed:
+                control_angular_speed = min(target_angular_speed, control_angular_speed + 0.1)
+            elif target_angular_speed < control_angular_speed:
+                control_angular_speed = max(target_angular_speed, control_angular_speed - 0.1)
+            else:
+                control_angular_speed = target_angular_speed
+
+            twist = Twist()
+            twist.linear.x = control_linear_speed
+            twist.linear.y = 0 
+            twist.linear.z = 0
+            twist.angular.x = 0
+            twist.angular.y = 0
+            twist.angular.z = control_angular_speed
+            publisher.publish(twist)
+
+	    #print("loop: {0}".format(count))
+            #print("target: vx: {0}, wz: {1}".format(target_speed, target_turn))
+            #print("publihsed: vx: {0}, wz: {1}".format(twist.linear.x, twist.angular.z))
+
+    except Exception as e:
+        print(e)
+
+    finally:
+        twist = Twist()
+        twist.linear.x = 0; twist.linear.y = 0; twist.linear.z = 0
+        twist.angular.x = 0; twist.angular.y = 0; twist.angular.z = 0
+        publisher.publish(twist)
+
+
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, terminal_settings)
+
